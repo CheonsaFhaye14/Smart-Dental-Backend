@@ -22,18 +22,10 @@ const checkAdmin = async (req, res, next) => {
   }
 };
 
-// ✅ GET ALL USERS (exclude soft-deleted)
+// ✅ GET ALL USERS (check users table first)
 router.get('/all', checkAdmin, async (req, res) => {
   try {
-    const { data: users, error: authError } = await supabase.auth.admin.listUsers();
-    if (authError) throw authError;
-
-    const authInfo = users.users.map(u => ({
-      id: u.id,
-      email: u.email,
-      created_at: u.created_at
-    }));
-
+    // 1️⃣ Get all non-deleted users from your "users" table
     const { data: profiles, error: dbError } = await supabase
       .from('users')
       .select(`
@@ -41,24 +33,40 @@ router.get('/all', checkAdmin, async (req, res) => {
         contact, address, gender, allergies, medicalhistory,
         is_deleted, created_at
       `)
-      .or('is_deleted.is.null,is_deleted.eq.false');
+      .eq('is_deleted', false); // only not deleted
 
     if (dbError) throw dbError;
 
-    const merged = authInfo
-      .map(a => {
-        const match = profiles.find(p => p.id === a.id) || {};
-        return { ...a, ...match };
+    console.log("Profiles from DB (not deleted):", profiles);
+
+    // 2️⃣ Get all users from Supabase Auth
+    const { data: authData, error: authError } = await supabase.auth.admin.listUsers();
+    if (authError) throw authError;
+
+    console.log("Supabase auth users:", authData);
+
+    // 3️⃣ Map profiles and attach email from auth.users
+    const merged = profiles
+      .map(profile => {
+        const authUser = authData.users.find(u => u.id === profile.id) || {};
+        return {
+          ...profile,
+          email: authUser.email || null, // add email from auth.users
+          created_at_auth: authUser.created_at || null // optional: auth creation date
+        };
       })
-      .filter(u => !u.is_deleted)
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at)); // sort by DB creation date
+
+    console.log("Merged users:", merged);
 
     res.json(merged);
   } catch (err) {
-    console.error(err);
+    console.error("Error in /all route:", err);
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+
+
 
 // ✅ ADD NEW USER (DEBUG MODE)
 router.post('/add', checkAdmin, async (req, res) => {
