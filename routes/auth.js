@@ -15,7 +15,7 @@ const generateTokens = (user) => {
   return { accessToken, refreshToken };
 };
 
-// ------------------ WEBSITE LOGIN (Admins Only) ------------------
+// ------------------ WEBSITE LOGIN (Admins Only) Working ------------------
 router.post('/website/login', [
   body('username').isLength({ min: 3 }).withMessage('Username must be at least 3 characters long'),
   body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters long'),
@@ -26,29 +26,43 @@ router.post('/website/login', [
   const { username, password } = req.body;
 
   try {
-    // Fetch user
-    const { data: userData, error: userError } = await supabase
+    // 1) Get user from your custom table
+    const { data: localUser, error: localError } = await supabase
       .from('users')
-      .select('*')
+      .select('id, usertype, username')
       .eq('username', username)
       .single();
 
-    if (userError || !userData) return res.status(400).json({ message: 'User not found.' });
+    if (localError || !localUser) {
+      return res.status(400).json({ message: 'User not found.' });
+    }
 
-    const user = userData;
-
-    // Check if admin
-    if (user.usertype !== 'admin') {
+    if (localUser.usertype !== 'admin') {
       return res.status(403).json({ message: 'Access denied. Admins only.' });
     }
 
-    // Compare password (assuming passwords are hashed)
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ message: 'Incorrect password' });
+    // 2) Fetch Auth user email via Supabase Admin API
+    const { data: authData, error: authError } = await supabase.auth.admin.getUserById(localUser.id);
 
-    // Generate JWT
+    if (authError || !authData?.user) {
+      return res.status(400).json({ message: 'Failed to find auth user.' });
+    }
+
+    const userEmail = authData.user.email;
+
+    // 3) Validate password using Supabase Auth
+    const { error: loginError } = await supabase.auth.signInWithPassword({
+      email: userEmail,
+      password
+    });
+
+    if (loginError) {
+      return res.status(400).json({ message: 'Incorrect password.' });
+    }
+
+    // 4) Generate JWT
     const token = jwt.sign(
-      { id: user.id, username: user.username, usertype: user.usertype },
+      { id: localUser.id, username: localUser.username, usertype: localUser.usertype },
       process.env.JWT_SECRET,
       { expiresIn: '24h' }
     );
@@ -57,11 +71,12 @@ router.post('/website/login', [
       message: 'Admin login successful',
       token,
       user: {
-        id: user.id,
-        username: user.username,
-        usertype: user.usertype,
+        id: localUser.id,
+        username: localUser.username,
+        usertype: localUser.usertype,
       },
     });
+
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Server error during login.' });
@@ -214,7 +229,7 @@ router.post('/app/register', [
   }
 });
 
-// ------------------ FORGOT PASSWORD ------------------
+// ------------------ FORGOT PASSWORD Working ------------------
 router.post('/forgot-password', [
   body('email').isEmail().withMessage('Valid email is required')
 ], async (req, res) => {
@@ -224,33 +239,59 @@ router.post('/forgot-password', [
   const { email } = req.body;
 
   try {
-    const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: process.env.FORGOTPASS_URL // URL user will be redirected to after reset
-    });
+      // 1️⃣ Check if the email exists in auth.users
+      const { data: users, error: listError } = await supabase.auth.admin.listUsers({
+        filter: `email=eq.${email}`
+      });
 
-    if (error) return res.status(400).json({ message: error.message });
+      if (listError) {
+        return res.status(500).json({ message: "Error checking user existence", error: listError.message });
+      }
 
-    return res.status(200).json({ message: 'Password reset email sent successfully.' });
-  } catch (err) {
-    console.error('Error during forgot password:', err.message);
-    return res.status(500).json({
-      message: 'Server error during password reset.',
-      error: err.message
-    });
+      if (!users || users.length === 0) {
+        // Return 404 so frontend knows the email doesn't exist
+        return res.status(404).json({ message: "Email not found" });
+      }
+
+      // 2️⃣ Send password reset email
+      const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: process.env.FORGOTPASS_URL
+      });
+
+      if (error) return res.status(400).json({ message: error.message });
+
+      return res.status(200).json({ message: 'Password reset email sent successfully.' });
+
+    } catch (err) {
+      console.error('Error during forgot password:', err.message);
+      return res.status(500).json({
+        message: 'Server error during password reset.',
+        error: err.message
+      });
+    }
   }
-});
+);
 
-// ------------------ RESET PASSWORD ------------------
-router.post('/reset-password', [
-  body('newPassword').isLength({ min: 6 }).withMessage('Password must be at least 6 characters long')
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+// ------------------ RESET PASSWORD Working ------------------
+router.post('/reset-password', async (req, res) => {
+  const { access_token, newPassword } = req.body;
 
-  const { newPassword } = req.body;
+  if (!access_token) return res.status(400).json({ message: "Access token is required." });
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ message: "Password must be at least 6 characters long" });
+  }
 
   try {
-    const { data, error } = await supabase.auth.updateUser({
+    // 1️⃣ Get user info using token
+    const { data: session, error: sessionError } = await supabase.auth.getUser(access_token);
+    if (sessionError || !session.user) {
+      return res.status(400).json({ message: "Invalid or expired token." });
+    }
+
+    const userId = session.user.id;
+
+    // 2️⃣ Update password using Admin API
+    const { data, error } = await supabase.auth.admin.updateUserById(userId, {
       password: newPassword
     });
 
@@ -259,10 +300,7 @@ router.post('/reset-password', [
     return res.status(200).json({ message: 'Password updated successfully.' });
   } catch (err) {
     console.error('Error resetting password:', err.message);
-    return res.status(500).json({
-      message: 'Server error during password reset.',
-      error: err.message
-    });
+    return res.status(500).json({ message: 'Server error during password reset.', error: err.message });
   }
 });
 

@@ -9,8 +9,10 @@ app.use(express.json());
 // import and use routes
 const authRoutes = require('./routes/auth');
 const bucketRoutes = require('./routes/buckets');
+const userRoutes = require('./routes/users');
 app.use('/auth', authRoutes);
 app.use('/buckets', bucketRoutes);
+app.use('/users', userRoutes);
 
 // start server
 const PORT = process.env.PORT || 3000;
