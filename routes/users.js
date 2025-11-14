@@ -6,18 +6,23 @@ const jwt = require("jsonwebtoken");
 // Middleware to check admin from JWT
 const checkAdmin = async (req, res, next) => {
   try {
-    const token = req.headers.authorization?.split(" ")[1];
+    const rawHeader = req.headers.authorization;
+    const token = rawHeader?.split(" ")[1];
+
     if (!token) return res.status(401).json({ message: "No token" });
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
     if (decoded.usertype !== "admin") {
       return res.status(403).json({ message: "Admins only" });
     }
 
     req.user = decoded;
+    req.token = token; // ✅ Save token for later logging
+
     next();
   } catch (err) {
-    console.error(err);
+    console.error("checkAdmin error:", err);
     return res.status(401).json({ message: "Invalid token" });
   }
 };
@@ -25,6 +30,11 @@ const checkAdmin = async (req, res, next) => {
 // ✅ GET ALL USERS (check users table first)
 router.get('/all', checkAdmin, async (req, res) => {
   try {
+
+    // ✅ Log token + decoded info
+    console.log("\n🔐 Token used for /all:", req.token);
+    console.log("👤 Decoded user:", req.user);
+
     // 1️⃣ Get all non-deleted users from your "users" table
     const { data: profiles, error: dbError } = await supabase
       .from('users')
@@ -33,31 +43,43 @@ router.get('/all', checkAdmin, async (req, res) => {
         contact, address, gender, allergies, medicalhistory,
         is_deleted, created_at
       `)
-      .eq('is_deleted', false); // only not deleted
+      .eq('is_deleted', false);
 
     if (dbError) throw dbError;
 
-    console.log("Profiles from DB (not deleted):", profiles);
+    // 2️⃣ Get all users from Supabase Auth (handle pagination)
+    let allAuthUsers = [];
+    let page = 1;
+    const perPage = 100;
+    while (true) {
+      const { data: authData, error: authError } = await supabase.auth.admin.listUsers({ page, perPage });
+      if (authError) throw authError;
 
-    // 2️⃣ Get all users from Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.admin.listUsers();
-    if (authError) throw authError;
+      allAuthUsers = allAuthUsers.concat(authData.users);
 
-    console.log("Supabase auth users:", authData);
+      if (!authData.nextPage) break;
+      page++;
+    }
 
-    // 3️⃣ Map profiles and attach email from auth.users
+    // 3️⃣ Merge profiles and attach email from auth.users
     const merged = profiles
       .map(profile => {
-        const authUser = authData.users.find(u => u.id === profile.id) || {};
+        const authUser = allAuthUsers.find(u => u.id === profile.id) || {};
         return {
           ...profile,
-          email: authUser.email || null, // add email from auth.users
-          created_at_auth: authUser.created_at || null // optional: auth creation date
+          email: authUser.email || null,
+          created_at_auth: authUser.created_at || null
         };
       })
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at)); // sort by DB creation date
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
-    console.log("Merged users:", merged);
+    // 4️⃣ Count users by type
+    const userTypeCount = merged.reduce((acc, user) => {
+      acc[user.usertype] = (acc[user.usertype] || 0) + 1;
+      return acc;
+    }, {});
+
+    console.log("📊 User count by type:", userTypeCount);
 
     res.json(merged);
   } catch (err) {
@@ -68,11 +90,9 @@ router.get('/all', checkAdmin, async (req, res) => {
 
 
 
-// ✅ ADD NEW USER (DEBUG MODE)
-router.post('/add', checkAdmin, async (req, res) => {
+// ✅ ADD NEW USER (DEBUG MODE) working
+router.post('/add', checkAdmin, async (req, res) => { 
   console.log("🔥 /users/add called");
-  console.log("📩 Request Body:", req.body);
-  console.log("🧑‍💼 Authenticated Admin:", req.user);
 
   const {
     username,
@@ -89,100 +109,112 @@ router.post('/add', checkAdmin, async (req, res) => {
     medicalhistory,
   } = req.body;
 
-  // Validate fields
   if (!username || !email || !password || !usertype || !firstname || !lastname) {
-    console.log("❌ Missing required fields");
     return res.status(400).json({ message: 'Required fields missing' });
   }
 
-  let createdUserId = null;
+  // ✅ Format names (capitalize first letter)
+  const cap = (str) => str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
+  const formattedFirst = cap(firstname);
+  const formattedLast = cap(lastname);
+
+  // ✅ Normalize username (optional: lowercase)
+  const formattedUsername = username.toLowerCase();
 
   try {
-    // ✅ 1. Create user in Supabase Auth
-    console.log("🔐 Creating Supabase Auth user...");
-    const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-    });
+    // ✅ 1. Check if email exists in Auth
+    const { data: authList } = await supabase.auth.admin.listUsers();
+    const matchedUser = authList.users.find(u => u.email === email);
 
-    console.log("📦 Auth Response:", authUser, authError);
+    let userIdToUse = null;
 
-    if (authError) {
-      console.log("❌ Auth Error:", authError);
-      throw new Error(authError.message || "Email already exists or invalid.");
+    if (matchedUser) {
+      console.log("📌 Email exists in Auth:", matchedUser.id);
+
+      const { data: existingProfile } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', matchedUser.id)
+        .maybeSingle();
+
+      if (!existingProfile || existingProfile.is_deleted === true) {
+        console.log("♻️ Profile missing or deleted → reusing:", matchedUser.id);
+        userIdToUse = matchedUser.id;
+      } else {
+        return res.status(400).json({ message: 'Email already in use by an active user.' });
+      }
+
+    } else {
+      const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true,
+      });
+
+      if (authError) throw new Error(authError.message);
+
+      userIdToUse = authUser.user.id;
+      console.log("✅ Created new Auth user:", userIdToUse);
     }
 
-    createdUserId = authUser.user.id;
-    console.log("✅ Created auth user with ID:", createdUserId);
-
-    // ✅ 2. Insert user profile into `users`
-    console.log("📝 Inserting profile into users table...");
-    const { data: newUser, error: insertError } = await supabase
+    // ✅ 4. Insert / Restore profile
+    const { data: newUser, error: profileError } = await supabase
       .from('users')
-      .insert([{
-        id: createdUserId,
-        username,
+      .upsert({
+        id: userIdToUse,
+        username: formattedUsername,
         usertype,
-        firstname,
-        lastname,
+        firstname: formattedFirst,
+        lastname: formattedLast,
         birthdate,
         contact,
         address,
         gender,
         allergies,
         medicalhistory,
-      }])
+        is_deleted: false,
+        deleted_at: null,
+        updated_at: new Date()
+      })
       .select()
       .single();
 
-    console.log("📦 Insert Response:", newUser, insertError);
+    if (profileError) throw new Error(profileError.message);
 
-    if (insertError) {
-      console.log("❌ Insert Error:", insertError);
-      throw new Error(insertError.message || "Failed to save user profile.");
-    }
+    console.log("✅ User profile inserted/restored:", newUser.id);
 
-    // ✅ 3. Activity Log (STRICT)
-    console.log("🧾 Writing activity log...");
+    // ✅ 5. Activity Log
+    console.log("🧾 Attempting to write activity log...");
+    console.log("📝 Log Details:", {
+      admin_id: req.user.id,
+      record_id: newUser.id,
+      action: "create_or_restore_user"
+    });
+
     const { error: logError } = await supabase
       .from('activity_logs')
       .insert([{
         admin_id: req.user.id,
-        action: 'create_user',
+        action: 'create_or_restore_user',
         table_name: 'users',
         record_id: newUser.id,
-        description: `Admin created user: ${firstname} ${lastname} (${email})`,
+        description: `Admin created/restored user: ${formattedFirst} ${formattedLast} (${email})`,
       }]);
 
-    console.log("🧾 Log Response:", logError);
-
     if (logError) {
-      console.log("❌ Activity Log Error:", logError);
-      throw new Error(logError.message || "Failed to write activity log.");
+      console.log("❌ Activity Log INSERT FAILED:", logError);
+    } else {
+      console.log("✅ Activity log recorded successfully!");
     }
 
-    console.log("✅ USER CREATION COMPLETE!");
-
     return res.status(201).json({
-      message: 'User created successfully',
+      message: matchedUser ? 'User restored successfully' : 'User created successfully',
       user: newUser,
     });
 
-  } catch (error) {
-    console.log("💥 CATCH BLOCK TRIGGERED");
-    console.log("❌ ERROR MESSAGE:", error.message);
-
-    if (createdUserId) {
-      console.log("♻️ Rolling back created user & profile...");
-      await supabase.from('users').delete().eq('id', createdUserId);
-      await supabase.auth.admin.deleteUser(createdUserId);
-      console.log("✅ Rollback completed.");
-    }
-
-    return res.status(500).json({
-      message: error.message || "Could not create user.",
-    });
+  } catch (err) {
+    console.log("💥 ERROR:", err.message);
+    return res.status(500).json({ message: err.message || 'Server error' });
   }
 });
 
@@ -238,7 +270,7 @@ router.delete('/delete/:id', checkAdmin, async (req, res) => {
 
     // 4️⃣ Respond
     return res.status(200).json({
-      message: "User soft-deleted successfully",
+      message: "User deleted successfully",
       user: deletedUser
     });
 
@@ -248,5 +280,134 @@ router.delete('/delete/:id', checkAdmin, async (req, res) => {
   }
 });
 
+router.put('/edit/:id', checkAdmin, async (req, res) => {
+  console.log("🔥 /users/edit called");
+
+  const userId = req.params.id;
+  delete req.body.id; // Prevent accidental override
+
+  const {
+    username,
+    email,
+    password,
+    usertype,
+    firstname,
+    lastname,
+    birthdate,
+    contact,
+    address,
+    gender,
+    allergies,
+    medicalhistory,
+  } = req.body;
+
+  if (!username || !email || !usertype || !firstname || !lastname) {
+    return res.status(400).json({ message: "Required fields missing" });
+  }
+
+  const validUsertypes = ["patient", "dentist", "admin"];
+  if (!validUsertypes.includes(usertype.toLowerCase())) {
+    return res.status(400).json({ message: "Invalid usertype" });
+  }
+
+  try {
+    // ✅ Fetch existing user
+    const { data: existingUser, error: fetchErr } = await supabase
+      .from("users")
+      .select("*")
+      .eq("id", userId)
+      .single();
+
+    if (fetchErr || !existingUser) {
+      console.log("❌ User not found in users table", fetchErr);
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // ✅ Check unique username
+    const { data: usernameExists } = await supabase
+      .from("users")
+      .select("id")
+      .eq("username", username)
+      .neq("id", userId);
+
+    if (usernameExists?.length > 0) {
+      return res.status(409).json({ message: "Username already exists" });
+    }
+
+    // ✅ Update Supabase Auth (email/password only)
+    if (email !== existingUser.email || password) {
+      const { error: authUpdateError } = await supabase.auth.admin.updateUserById(
+        userId,
+        {
+          email,
+          ...(password && { password }),
+        }
+      );
+
+      if (authUpdateError) {
+        console.log("❌ Auth update error", authUpdateError);
+        return res.status(500).json({ message: authUpdateError.message });
+      }
+    }
+
+    // ✅ Only update profile fields — NO email here
+    const profilePayload = {
+      username,
+      usertype,
+      firstname,
+      lastname,
+      birthdate,
+      contact,
+      address,
+      gender,
+      allergies,
+      medicalhistory,
+      updated_at: new Date()
+    };
+
+    const { data: updatedUser, error: updateErr } = await supabase
+      .from("users")
+      .update(profilePayload)
+      .eq("id", userId)
+      .select()
+      .single();
+
+    if (updateErr) {
+      return res.status(500).json({ message: "Failed to update user" });
+    }
+
+    // ✅ Track changed fields
+    const changes = {};
+    const changedFields = [];
+
+    Object.keys(profilePayload).forEach(field => {
+      if (existingUser[field]?.toString() !== updatedUser[field]?.toString()) {
+        changes[field] = existingUser[field];
+        changedFields.push(field);
+      }
+    });
+
+    if (changedFields.length > 0) {
+      await supabase.from("activity_logs").insert([{
+        admin_id: req.user.id,
+        action: "update_user",
+        table_name: "users",
+        record_id: userId,
+        description: `Admin updated ${firstname} ${lastname} (${changedFields.join(", ")})`,
+        undo_data: { primary_key: "id", table: "users", data: changes }
+      }]);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "User updated successfully",
+      user: { ...updatedUser, email }, // return email
+    });
+
+  } catch (error) {
+    console.error("💥 ERROR:", error);
+    return res.status(500).json({ message: "Server error", error: error.message });
+  }
+});
 
 module.exports = router;
