@@ -1,86 +1,79 @@
 const express = require('express');
+const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const supabase = require('../supabase');
-const jwt = require('jsonwebtoken');
+const checkAdmin = require('../middleware/checkAdmin');
 
-const router = express.Router();
-
-// Middleware to check admin from JWT
-const checkAdmin = async (req, res, next) => {
+// GET /services/grouped - Get services grouped by category (admin only)
+router.get('/grouped', checkAdmin, async (req, res) => {
   try {
-    const rawHeader = req.headers.authorization;
-    const token = rawHeader?.split(" ")[1];
+    const search = (req.query.search || '').trim();
+    const includeInactive = req.query.includeInactive === 'true';
 
-    if (!token) return res.status(401).json({ message: "No token" });
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    if (decoded.usertype !== "admin") {
-      return res.status(403).json({ message: "Admins only" });
-    }
-
-    req.user = decoded;
-    req.token = token; // save token
-    next();
-  } catch (err) {
-    console.error("checkAdmin error:", err);
-    return res.status(401).json({ message: "Invalid token" });
-  }
-};
-
-// GET all services grouped by category
-router.get('/grouped', async (req, res) => {
-  try {
-    const { data: categories, error: catError } = await supabase
+    let categoryQuery = supabase
       .from('service_categories')
       .select('*')
       .eq('is_deleted', false)
       .order('name', { ascending: true });
-    if (catError) return res.status(400).json({ message: catError.message });
 
-    const { data: services, error: servError } = await supabase
+    let serviceQuery = supabase
       .from('services')
       .select('*')
       .eq('is_deleted', false);
-    if (servError) return res.status(400).json({ message: servError.message });
 
-    const { data: links, error: linkError } = await supabase
-      .from('service_category_links')
-      .select('*')
-      .eq('is_deleted', false);
-    if (linkError) return res.status(400).json({ message: linkError.message });
+    if (!includeInactive) {
+      serviceQuery = serviceQuery.eq('is_active', true);
+    }
+
+    if (search) {
+      serviceQuery = serviceQuery.ilike('name', `%${search}%`);
+    }
+
+    const [
+      { data: categories, error: catError },
+      { data: services, error: servError },
+      { data: links, error: linkError }
+    ] = await Promise.all([
+      categoryQuery,
+      serviceQuery,
+      supabase.from('service_category_links').select('*').eq('is_deleted', false)
+    ]);
+
+    if (catError) throw catError;
+    if (servError) throw servError;
+    if (linkError) throw linkError;
 
     // Map categoryId -> category object (preserve order from categories array)
     const categoryMap = Object.fromEntries(
       categories.map(cat => [cat.id, { id: cat.id, name: cat.name, services: [] }])
     );
 
-    // Initialize "No Category" bucket
-    const noCategory = { id: null, name: "No Category", services: [] };
+    // "No Category" bucket for services with no links
+    const noCategory = { id: null, name: 'No Category', services: [] };
 
-    // Assign services to categories
+    // Assign each service to every category it's linked to (services can belong to multiple)
     services.forEach(serv => {
-      const link = links.find(l => l.service_id === serv.id);
-      const categoryObj = link ? categoryMap[link.category_id] : null;
+      const serviceLinks = links.filter(l => l.service_id === serv.id);
 
-      if (categoryObj) {
-        categoryObj.services.push(serv);
-      } else {
+      if (serviceLinks.length === 0) {
         noCategory.services.push(serv);
+        return;
       }
-    });
 
-    // Sort services inside each category (optional but nice)
-    Object.values(categoryMap).forEach(cat => {
-      cat.services.sort((a, b) => {
-        const aName = (a.name || "").toString().trim().toLowerCase();
-        const bName = (b.name || "").toString().trim().toLowerCase();
-        return aName.localeCompare(bName);
+      serviceLinks.forEach(link => {
+        const categoryObj = categoryMap[link.category_id];
+        if (categoryObj) categoryObj.services.push(serv);
       });
     });
-    noCategory.services.sort((a, b) => (a.name || "").toString().localeCompare((b.name || "").toString(), undefined, { sensitivity: 'base' }));
 
-    // Build array from categoryMap and explicitly sort categories A→Z (case-insensitive)
+    // Sort services inside each category
+    const sortByName = (a, b) =>
+      (a.name || '').toString().trim().toLowerCase().localeCompare((b.name || '').toString().trim().toLowerCase());
+
+    Object.values(categoryMap).forEach(cat => cat.services.sort(sortByName));
+    noCategory.services.sort(sortByName);
+
+    // Build sorted category array
     let groupedArray = Object.values(categoryMap).sort((a, b) =>
       a.name.toString().trim().toLowerCase().localeCompare(b.name.toString().trim().toLowerCase())
     );
@@ -88,10 +81,9 @@ router.get('/grouped', async (req, res) => {
     // Put "No Category" at the end if it has services
     if (noCategory.services.length > 0) groupedArray.push(noCategory);
 
-    // Return grouped result
-    res.json({ category: groupedArray });
+    res.json({ data: groupedArray });
   } catch (err) {
-    console.error(err);
+    console.error('Error in /grouped route:', err);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
@@ -172,9 +164,6 @@ router.post(
           linked_services: servicesArray
         }
       });
-
-      // ✅ Notification + Logging
-      console.log("📢 Attempting to send notification for new category...");
 
       const notifText = `New category created: ${name}`;
 

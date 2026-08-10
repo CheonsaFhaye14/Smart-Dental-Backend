@@ -11,11 +11,13 @@ const authRoutes = require('./routes/auth');
 const bucketRoutes = require('./routes/buckets');
 const userRoutes = require('./routes/users');
 const serviceRoutes = require('./routes/services')
+const medicalReferenceRoutes = require('./routes/medicalReference');
 
 app.use('/auth', authRoutes);
 app.use('/buckets', bucketRoutes);
 app.use('/users', userRoutes);
 app.use('/services',serviceRoutes);
+app.use('/medical-reference', medicalReferenceRoutes);
 
 // start server
 const PORT = process.env.PORT || 3000;
